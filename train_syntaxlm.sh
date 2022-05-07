@@ -1,0 +1,13 @@
+python train.py \
+    --mode='syntaxlm+head' \
+    --submodel=13 \
+    --syntax_fusion='late_fusion' \
+    --pooling='average' \
+    --lm='bert-base-uncased' \
+    --cv_splits=2 \
+    --epochs=50 \
+    --head_cmd="MLP(input_dim, 16, output_dim, dropout=0.5, norm=True, norm_momentum=0.1)" \
+    --loss_cmd="MSELoss(reduction='none')" \
+    --lr=0.0001 \
+    --syntax_encoder_lr=0.03 \
+    --wandb_on

@@ -8,13 +8,15 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn import model_selection
+import transformers
 import torch
 from torch import nn
 from torch.nn import (
     functional as F,
     MSELoss,
 )
-import transformers
+from typing import List
+from argparse import Namespace
 
 import wandb
 from wandb_config import config; config()
@@ -30,7 +32,24 @@ from xgboost.sklearn import XGBRegressor # <3
 import gc
 
 
-
+# Syntax-Augmented BERT
+from lib.syntax_augmented_bert.utils.loader import (
+    FeaturizedDataset,
+    FeaturizedDataLoader,
+)
+from lib.syntax_augmented_bert import model
+from lib.syntax_augmented_bert.utils import (
+    constant,
+)
+from lib.syntax_augmented_bert.utils.utils import (
+    OntoNotesSRLProcessor,
+    InputExample,
+)
+from lib.syntax_augmented_bert.opt import get_args
+from lib.syntax_augmented_bert.main import (
+    load_and_cache_examples,
+    MODEL_CLASSES,
+)
 
 
 
@@ -45,7 +64,9 @@ def load_data(path):
     df = df.loc[df['standard_error'] > 0]
     return df
 
-
+def load_syntax_data(path) -> List[InputExample]:
+    examples = OntoNotesSRLProcessor().get_unk_examples(path)
+    return examples
 
 # ========================================================
 #                          utils 
@@ -138,6 +159,39 @@ def do_pred(lm, head, tokenizer, X, submodel, device, pooling, batch_size=99999,
         preds = torch.cat(preds, dim=0)
     return preds
 
+def do_syntaxlm_pred(lm, head, tokenizer, X_synt: FeaturizedDataset,
+                     submodel, device, pooling, batch_size=99999, mixer=None):
+    n = len(X_synt)
+    preds = []
+    dataloader = FeaturizedDataLoader(X_synt, opt=Namespace(task_name='readability', device=device), batch_size=batch_size)
+    for i in range(0, n, batch_size):
+        batch = dataloader._collate_fn(X_synt[i:i+batch_size])
+        tokens = {
+            'input_ids': batch['input_ids'],
+            'token_type_ids': batch['token_type_ids'],
+            'wp_token_mask': batch['wp_token_mask'],
+            'dep_head': batch['dep_head'],
+            'dep_rel': batch['dep_rel'],
+            'wp_rows': batch['wp_rows'],
+            'align_sizes': batch['align_sizes'],
+            'seq_len': batch['seq_len'],
+            'subj_pos': batch['subj_pos'],
+            'obj_pos': batch['obj_pos'],
+            'linguistic_token_mask': batch['linguistic_token_mask'],
+        }
+
+        textemb = _get_lm_submodal_textemb(lm, tokens, submodel=submodel, pooling=pooling, concat=(mixer is None))
+        if mixer is not None:
+            textemb = mixer(textemb)
+        pred = head(textemb)
+        pred = pred.squeeze(-1)
+        preds.append(pred)
+    if len(preds) == 1:
+        preds = preds[0]
+    else:
+        preds = torch.cat(preds, dim=0)
+    return preds
+
 def _get_lm_submodal_textemb(lm, tokens, submodel, pooling, concat=True):
 
     def _pooling(hidden_states, mask):
@@ -155,23 +209,35 @@ def _get_lm_submodal_textemb(lm, tokens, submodel, pooling, concat=True):
     segs = re.split(r'[,-]', submodel)
     if any([seg != 'word_embedding' for seg in segs]):
         output = lm(**tokens, output_hidden_states=True)
+
+    if hasattr(tokens, 'attention_mask'):
+        mask = tokens.attention_mask
+    elif isinstance(tokens, dict) and ('wp_token_mask' in tokens):
+        mask = tokens['wp_token_mask']
+    else:
+        raise ValueError
+
+    if isinstance(tokens, dict):
+        input_ids = tokens['input_ids']
+    else:
+        input_ids = tokens.input_ids
         
     textembs = []
     for layer in segs:
         if layer.isdecimal():
             layer = int(layer)
-            assert 0 <= layer <= num_layers
-            hidden_states = output.hidden_states[layer] # (batch_size, seqlen, dim)
-            textemb = _pooling(hidden_states, tokens.attention_mask)
+            # assert 0 <= layer <= num_layers
+            hidden_state = output[-1][layer] # (batch_size, seqlen, dim)
+            textemb = _pooling(hidden_state, mask)
         
         else:
             assert layer in ['word_embedding', 'pooler']
             if layer == 'word_embedding':
                 wordemb = guess_wordemb(lm)
-                hidden_states = wordemb(tokens.input_ids)
-                textemb = _pooling(hidden_states, tokens.attention_mask)
+                hidden_state = wordemb(input_ids)
+                textemb = _pooling(hidden_state, mask)
             elif layer == 'pooler':
-                textemb = output.pooler_output
+                textemb = output[1]
             else:
                 raise ValueError(layer)
         
@@ -188,7 +254,7 @@ def _get_lm_submodal_textemb(lm, tokens, submodel, pooling, concat=True):
             return textembs
 
 
-def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, eval_X=None, eval_y_mean=None, eval_y_std=None, mixer=None):
+def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, eval_X=None, eval_y_mean=None, eval_y_std=None, mixer=None, syntax=False):
     if isinstance(X, pd.Series):
         X = X.tolist()
 
@@ -197,6 +263,11 @@ def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, ev
     X_train, X_eval = X[:num_train], X[num_train:]
     y_mean_train, y_mean_eval = y_mean[:num_train], y_mean[num_train:]
     y_std_train, y_std_eval = y_std[:num_train], y_std[num_train:]
+
+    if syntax:
+        pred_func = do_syntaxlm_pred
+    else:
+        pred_func = do_pred
 
     # construct readability evaluation model
     head = copy.deepcopy(head)
@@ -209,6 +280,11 @@ def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, ev
             'params': mixer.parameters(),
             'lr': 1e-2,
         }]
+    if syntax:
+        parameters += [{
+            'params': lm.syntax_encoder.parameters(),
+            'lr': args.syntax_encoder_lr,
+        }]
     if args.train_lm:
         lm = copy.deepcopy(lm)
         lm.train()
@@ -218,6 +294,11 @@ def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, ev
     else:
         lm.eval()
     lm.requires_grad_(args.train_lm)
+    if syntax:
+        lm.syntax_encoder.requires_grad_(True)
+        lm.syntax_encoder.train()
+    print("Parameters:")
+    print(parameters)
 
     if args.optimizer == 'AdamW':
         optimizer = torch.optim.AdamW(parameters, lr=args.lr)
@@ -243,8 +324,8 @@ def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, ev
             y_std_train_batch = torch.tensor(y_std_train[j : j+args.batch_size], dtype=torch.float32, device=args.device)
 
             optimizer.zero_grad()
-            pred = do_pred(lm, head, tokenizer, X_train_batch,
-                           submodel=args.submodel, device=args.device, pooling=args.pooling, mixer=mixer)
+            pred = pred_func(lm, head, tokenizer, X_train_batch,
+                             submodel=args.submodel, device=args.device, pooling=args.pooling, mixer=mixer)
 
             loss = loss_func(pred, y_mean_train_batch)
             mean_loss = loss.mean()
@@ -269,10 +350,10 @@ def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, ev
             #     loss = loss_func(pred, y_mean_eval_batch)
             #     losses.extend(loss.tolist())
             
-            pred = do_pred(lm, head, tokenizer, X_eval,
-                           submodel=args.submodel, device=args.device, pooling=args.pooling,
-                           batch_size=args.batch_size,
-                           mixer=mixer)
+            pred = pred_func(lm, head, tokenizer, X_eval,
+                             submodel=args.submodel, device=args.device, pooling=args.pooling,
+                             batch_size=args.batch_size,
+                             mixer=mixer)
             loss = loss_func(pred, torch.tensor(y_mean_eval, dtype=torch.float32, device=args.device))
             loss = loss.tolist()
             eval_mean_loss = sum(loss) / len(loss)
@@ -298,7 +379,7 @@ def train_lm_readeval(lm, head, tokenizer, loss_func, X, y_mean, y_std, args, ev
             #         }, commit=False)
         
         if (eval_X is not None) and (eval_y_mean is not None) and (eval_y_std is not None):
-            pred = do_pred(lm, head, tokenizer, eval_X, submodel=args.submodel, device=args.device, pooling=args.pooling, mixer=mixer)
+            pred = pred_func(lm, head, tokenizer, eval_X, submodel=args.submodel, device=args.device, pooling=args.pooling, mixer=mixer)
             corr = pd.DataFrame({'pred': pred.tolist(), 'label': eval_y_mean}).corr().loc['pred', 'label']
             print(f"Correlation on evaluation set is {corr}")
 
@@ -407,8 +488,10 @@ def main(args):
         wandb.init()
         wandb.log(args.__dict__)
 
-    if args.mode == 'lm+head':
+    if args.mode in ['lm+head']:
         main_lm_head(args)
+    elif args.mode in ['syntaxlm+head']:
+        main_syntaxlm_head(args)
     elif args.mode == 'tfidf+xgboost':
         main_tfidf_xgboost(args)
     
@@ -499,13 +582,165 @@ def main_tfidf_xgboost(args):
         })
 
 
+def main_syntaxlm_head(args):
+
+    assert args.lm in ['bert-base-uncased']
+
+    # load data, tokenizer
+    data: pd.DataFrame = load_data(args.dataset)
+    syntax_data: List[InputExample] = load_syntax_data(args.syntax_dataset)
+    print(f'Length of data = {len(data)}')
+    print(f'Length of syntax_data = {len(syntax_data)}')
+
+    synt_opt = get_args([
+        '--model_type=syntax_bert_seq',
+        '--model_name_or_path=bert-base-uncased',
+        '--task_name=ontonotes_srl',
+        '--data_dir=data/dep/',
+        '--max_seq_length=512',
+        '--per_gpu_eval_batch_size=32',
+        '--output_dir=results/syntax/checkpoints/1/'
+        '--save_steps=1000', 
+        '--overwrite_output_dir',
+        '--num_train_epochs=20',
+        '--do_eval',
+        '--do_train',
+        '--evaluate_during_training',
+        '--config_name_or_path=lib/syntax_augmented_bert/config/srl/bert-base-uncased/joint_fusion.json',
+        '--per_gpu_train_batch_size=16',
+        '--gradient_accumulation_steps=1',
+        '--wordpiece_aligned_dep_graph',
+        '--seed=40',
+    ])
+    synt_label_map = constant.OntoNotes_SRL_LABEL_TO_ID
+    synt_num_labels = len(synt_label_map)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    cv_corr, cv_preds, cv_labels = [], [], []
+    for i, (train_ids, test_ids) in enumerate(
+            sklearn.model_selection.KFold(n_splits=args.cv_splits, shuffle=True, random_state=args.seed).split(data)
+            ):
+        print(f'\n=================== cross validation {i+1} / {args.cv_splits} =================')
+        data_train, data_test = data.iloc[train_ids], data.iloc[test_ids]
+        X_train_synt = FeaturizedDataset(
+            examples=[syntax_data[idx] for idx in train_ids],
+            opt=synt_opt,
+            tokenizer=tokenizer,
+            label_map=synt_label_map,
+            cls_token_segment_id=0,
+            pad_token_segment_id=0,
+        )
+        X_test_synt = FeaturizedDataset(
+            examples=[syntax_data[idx] for idx in test_ids],
+            opt=synt_opt,
+            tokenizer=tokenizer,
+            label_map=synt_label_map,
+            cls_token_segment_id=0,
+            pad_token_segment_id=0,
+        )
+
+        X_train, y_train_mean, y_train_std = data_train['excerpt'], data_train['target'], data_train['standard_error']
+        X_test, y_test_mean, y_test_std    = data_test['excerpt'], data_test['target'], data_test['standard_error']
+        X_train = _preprocess_text(X_train, lower=True)
+        X_test  = _preprocess_text(X_test, lower=True)
+
+        synt_config = model.SyntaxBertConfig.from_pretrained(f'lib/syntax_augmented_bert/config/srl/bert-base-uncased/{args.syntax_fusion}.json',
+                                                             num_labels=synt_num_labels,
+                                                             finetuning_task='ontonotes_srl')
+        syntlm = model.SyntaxBertForSequenceClassification.from_pretrained(args.lm, config=synt_config)
+        lm = syntlm.bert.to(args.device)
+        lm.requires_grad_(args.train_lm)
+        lm.syntax_encoder.requires_grad_(True)
+        input_dim = guess_lm_inputdim(lm, args.lm) * args.dim_multiplier
+        output_dim = 1
+
+        head      = eval(args.head_cmd).to(args.device)
+        mixer     = LayerMixer(num_layers=len(re.split(r'[-,]', args.submodel))).to(args.device) if args.mixing else None
+        loss_func = eval(args.loss_cmd).to(args.device)
+
+        additional_kwargs = {}
+        if args.test:
+            additional_kwargs.update({
+                'eval_X': X_test,
+                'eval_y_mean': y_test_mean,
+                'eval_y_std': y_test_std
+                })
+        if args.mixing:
+            additional_kwargs.update({
+                'mixer': mixer,
+            })
+        
+        trained_models, best_corr = train_lm_readeval(lm, head, tokenizer, loss_func, X_train_synt, y_train_mean, y_train_std, args, syntax=True, **additional_kwargs)
+        if args.wandb_on:
+            wandb.log({f'corr/cv{i:0>2d}/eval_best': best_corr})
+
+        # ============= save =============
+        if args.train_lm:
+            path = f'{args.savedir}/cv{i:0>2d}_lm'
+            torch.save(trained_models['lm'], path)
+            print(f'Saved lm to {path}')
+            if args.wandb_on:
+                wandb.save(path, base_path=args.savedir, policy='now')
+        if True:
+            path = f'{args.savedir}/cv{i:0>2d}_head'
+            torch.save(trained_models['head'], path)
+            print(f'Saved head to {path}')
+            if args.wandb_on:
+                wandb.save(path, base_path=args.savedir, policy='now')
+        if args.mixing:
+            path = f'{args.savedir}/cv{i:0>2d}_mixer'
+            mixer = trained_models["mixer"]
+            torch.save(mixer, path)
+            print(f'Mixer weights: {mixer.weight}')
+            print(f'Saved mixer to {path}')
+            if args.wandb_on:
+                wandb.save(path, base_path=args.savedir, policy='now')
+            
+            
+        if args.test:
+            break
+
+        # ============= cross validation test =============
+        with torch.no_grad():
+            lm = trained_models.get('lm', lm)
+            lm.eval()
+            head = trained_models.get('head', head)
+            head.eval()
+            pred = do_syntaxlm_pred(
+                lm=lm, head=head, tokenizer=tokenizer,
+                X_synt=X_test_synt,
+                submodel=args.submodel, device=args.device, pooling=args.pooling,
+                batch_size=args.batch_size, mixer=mixer)
+        pred = pred.tolist()
+        cv_preds.extend(pred)
+        cv_labels.extend(y_test_mean.tolist())
+        corr = pd.DataFrame({'pred': pred, 'label': y_test_mean}).corr().loc['pred', 'label']
+        cv_corr.append(corr)
+    
+    if args.wandb_on:
+        mean_corr = np.mean(cv_corr)
+        overall_corr = pd.DataFrame({'pred': cv_preds, 'label': cv_labels}).corr().loc['pred', 'label']
+        print(f'mean_corr={mean_corr:.3f}. overall_corr={overall_corr:.3f}')
+        if args.mixing:
+            mixer_weight_log = {}
+            for i, seg in enumerate(re.split(r'[-,]', args.submodel)):
+                weight = trained_models['mixer'].weight
+                mixer_weight_log[f'mixer_weight/{seg:0>2}'] = weight[i].item()
+            wandb.log(mixer_weight_log)
+        wandb.log({
+            'mean_corr': mean_corr,
+            'overall_corr': overall_corr,
+        })
 
 
 
 def main_lm_head(args):
-
     # load data, tokenizer
-    data = load_data(args.dataset)
+    data: pd.DataFrame = load_data(args.dataset)
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.lm)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -610,8 +845,11 @@ def get_parser():
     parser.add_argument('--dataset',        type=str,   default='data/commonlitreadabilityprize/train.csv')
     parser.add_argument('--savedir',        type=str,   default='results/')
     parser.add_argument('--mode',           type=str,   default='lm+head',
-                        choices=['lm+head', 'tfidf+xgboost'])
+                        choices=['lm+head', 'tfidf+xgboost', 'syntaxlm+head'])
     parser.add_argument('--lm',             type=str,   default='bert-base-uncased')
+    parser.add_argument('--syntax_fusion',  type=str,   default='joint_fusion',
+                        choices=['late_fusion', 'joint_fusion'])
+    parser.add_argument('--syntax_dataset', type=str,   default='data/dep/train.json')
     parser.add_argument('--seed',           type=int,   default=0)
     parser.add_argument('--batch_size',     type=int,   default=32)
     parser.add_argument('--epochs',         type=int,   default=50)
@@ -622,6 +860,7 @@ def get_parser():
     parser.add_argument('--loss_cmd',       type=str,   default="MSELoss(reduction='none')")
     parser.add_argument('--optimizer',      type=str,   default='AdamW')
     parser.add_argument('--lr',             type=float, default=0.0001)
+    parser.add_argument('--syntax_encoder_lr', type=float, default=0.01)
     parser.add_argument('--train_lm',       action='store_true')
     parser.add_argument('--pooling',        type=str,   default='max')
     parser.add_argument('--wandb_on',       action='store_true')
